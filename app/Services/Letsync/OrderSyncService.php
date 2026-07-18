@@ -76,6 +76,16 @@ class OrderSyncService
             'requires_prescription' => false,
             'is_prescription_request' => false,
         ]);
+
+        $createdAt = $this->parseDate($ocOrder['date_added'] ?? null);
+        if ($createdAt !== null) {
+            $order->created_at = $createdAt;
+        }
+        $modifiedAt = $this->parseDate($ocOrder['date_modified'] ?? null) ?? $createdAt;
+        if ($modifiedAt !== null) {
+            $order->updated_at = $modifiedAt;
+        }
+
         $order->save();
 
         $this->syncItems($order, $data['products']);
@@ -277,6 +287,20 @@ class OrderSyncService
         }
 
         return 'pending';
+    }
+
+    private function parseDate(?string $value): ?\Illuminate\Support\Carbon
+    {
+        $value = trim((string) $value);
+        if ($value === '' || str_starts_with($value, '0000-00-00')) {
+            return null;
+        }
+
+        try {
+            return \Illuminate\Support\Carbon::parse($value);
+        } catch (\Throwable) {
+            return null;
+        }
     }
 
     private function elapsed(int $start): int

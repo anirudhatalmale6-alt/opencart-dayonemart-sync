@@ -3,6 +3,8 @@
 namespace App\Services\Letsync;
 
 use App\Models\GroceryItem;
+use App\Models\Hub;
+use App\Models\InventoryStock;
 use App\Models\Item;
 use App\Models\ItemPrice;
 use App\Models\ItemStock;
@@ -53,6 +55,7 @@ class ProductSyncService
         $name = $this->name($description, $product, $externalId);
         $price = (float) ($product['price'] ?? 0);
         $quantity = (int) ($product['quantity'] ?? 0);
+        $isLimitedStock = (int) ($product['subtract'] ?? 1) === 1;
 
         $item = Item::where('external_id', $externalId)->first() ?? new Item();
         $item->external_id = $externalId;
@@ -89,15 +92,27 @@ class ProductSyncService
             [
                 'quantity' => $quantity,
                 'stock_type' => $quantity > 0 ? 'in_stock' : 'out_of_stock',
-                'is_limited_stock' => true,
+                'is_limited_stock' => $isLimitedStock,
             ]
         );
+
+        $this->syncInventory($item->id, max(0, $quantity), $isLimitedStock);
 
         if ((int) config('letsync.module_id') === 1) {
             GroceryItem::firstOrCreate(['item_id' => $item->id], ['is_halal' => false, 'has_label' => false]);
         }
 
         return $item;
+    }
+
+    private function syncInventory(int $itemId, int $quantity, bool $isLimitedStock): void
+    {
+        foreach (Hub::query()->pluck('id') as $hubId) {
+            InventoryStock::updateOrCreate(
+                ['item_id' => $itemId, 'hub_id' => $hubId, 'variant_key' => ''],
+                ['quantity' => $quantity, 'is_limited_stock' => $isLimitedStock]
+            );
+        }
     }
 
     private function resolveCategory(array $ocCategoryIds): array
