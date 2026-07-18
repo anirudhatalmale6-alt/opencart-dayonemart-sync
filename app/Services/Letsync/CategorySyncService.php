@@ -10,6 +10,7 @@ class CategorySyncService
 {
     public function __construct(
         private readonly OpenCartReader $reader,
+        private readonly ImageImporter $images,
         private readonly SyncLogger $logger,
     ) {}
 
@@ -26,13 +27,22 @@ class CategorySyncService
 
         if ((int) $data['parent_id'] === 0) {
             $category = $this->upsertCategory($data);
+            $this->images->sync('categories', $category->id, 'primary_image', $this->imagePaths($data));
             $this->logger->success('category', $event, $ocCategoryId, $category->id, $this->elapsed($start), 'Category synced');
 
             return;
         }
 
         $subCategory = $this->upsertSubCategory($data);
+        $this->images->sync('sub_categories', $subCategory->id, 'primary_image', $this->imagePaths($data));
         $this->logger->success('category', $event, $ocCategoryId, $subCategory->id, $this->elapsed($start), 'Sub-category synced');
+    }
+
+    private function imagePaths(array $data): array
+    {
+        $image = trim((string) ($data['image'] ?? ''));
+
+        return $image !== '' ? [$image] : [];
     }
 
     public function deleteByExternalId(int $ocCategoryId, string $event = 'delete_category'): void

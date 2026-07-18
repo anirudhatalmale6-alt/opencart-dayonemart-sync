@@ -77,7 +77,7 @@ class ImageImporter
 
         $response = Http::withHeaders([
             'User-Agent' => 'Mozilla/5.0 (compatible; LetsyncBot/1.0)',
-        ])->timeout(20)->retry(2, 500)->get($url);
+        ])->timeout(20)->retry(2, 500, throw: false)->get($url);
 
         if (! $response->successful() || $response->body() === '') {
             return null;

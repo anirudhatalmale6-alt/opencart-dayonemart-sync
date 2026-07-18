@@ -4,6 +4,7 @@ namespace App\Services\Letsync;
 
 use App\Models\Item;
 use App\Models\Order;
+use App\Models\OrderAddress;
 use App\Models\OrderItem;
 use App\Models\OrderPayment;
 use App\Models\User;
@@ -79,8 +80,49 @@ class OrderSyncService
 
         $this->syncItems($order, $data['products']);
         $this->syncPayment($order, $ocOrder, $totals['total']);
+        $this->syncAddresses($order, $ocOrder);
 
         return $order;
+    }
+
+    private function syncAddresses(Order $order, array $ocOrder): void
+    {
+        $email = trim((string) ($ocOrder['email'] ?? '')) ?: null;
+        $phone = trim((string) ($ocOrder['telephone'] ?? '')) ?: null;
+
+        $this->upsertAddress($order, 'billing', $ocOrder, 'payment_', $email, $phone);
+
+        $hasShipping = trim((string) ($ocOrder['shipping_address_1'] ?? '')) !== ''
+            || trim((string) ($ocOrder['shipping_city'] ?? '')) !== '';
+
+        if ($hasShipping) {
+            $this->upsertAddress($order, 'shipping', $ocOrder, 'shipping_', $email, $phone);
+        }
+    }
+
+    private function upsertAddress(Order $order, string $type, array $ocOrder, string $prefix, ?string $email, ?string $phone): void
+    {
+        $name = trim(($ocOrder[$prefix . 'firstname'] ?? '') . ' ' . ($ocOrder[$prefix . 'lastname'] ?? ''));
+        if ($name === '') {
+            $name = trim(($ocOrder['firstname'] ?? '') . ' ' . ($ocOrder['lastname'] ?? ''));
+        }
+
+        $addressLine = trim(($ocOrder[$prefix . 'address_1'] ?? '') . ' ' . ($ocOrder[$prefix . 'address_2'] ?? ''));
+
+        $address = OrderAddress::where('order_id', $order->id)->where('type', $type)->first() ?? new OrderAddress();
+        $address->fill([
+            'order_id' => $order->id,
+            'type' => $type,
+            'name' => $name ?: null,
+            'phone' => $phone,
+            'email' => $email,
+            'postal_code' => trim((string) ($ocOrder[$prefix . 'postcode'] ?? '')) ?: null,
+            'city' => trim((string) ($ocOrder[$prefix . 'city'] ?? '')) ?: null,
+            'state' => trim((string) ($ocOrder[$prefix . 'zone'] ?? '')) ?: null,
+            'country' => trim((string) ($ocOrder[$prefix . 'country'] ?? '')) ?: null,
+            'address' => $addressLine ?: null,
+        ]);
+        $address->save();
     }
 
     private function resolveCustomer(array $ocOrder): array
