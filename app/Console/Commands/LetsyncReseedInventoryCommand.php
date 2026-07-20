@@ -13,25 +13,27 @@ use Illuminate\Support\Facades\DB;
 use Throwable;
 
 /**
- * One-time re-seed of hub inventory from OpenCart quantities.
+ * Reset DayOneMart hub inventory.
  *
- * Resets each item's hub stock to the current OpenCart quantity and records a
- * single OPENING_BALANCE movement, giving DayOneMart a clean starting point for
- * its per-hub stock and profitability reports. After this, DayOneMart owns the
- * stock (the real-time sync no longer overwrites hub quantities).
+ * Default (zero mode): sets every item's hub stock to ZERO (tracked) and removes
+ * the letsync-created opening-balance movements, so DayOneMart manages stock
+ * fully on its own via purchase orders and delivery. OpenCart quantities are not
+ * imported.
+ *
+ * --from-opencart: legacy mode — seeds each hub stock from the current OpenCart
+ * quantity and records an OPENING_BALANCE movement.
  */
 class LetsyncReseedInventoryCommand extends Command
 {
     protected $signature = 'letsync:reseed-inventory
         {--hub=0 : Restrict to a single hub id (0 = all active hubs)}
-        {--reason= : Movement reason label}';
+        {--from-opencart : Seed hub stock from OpenCart quantities instead of zero}
+        {--reason= : Movement reason label (opencart mode only)}';
 
-    protected $description = 'Re-seed DayOneMart hub inventory from OpenCart opening balances (one-time).';
+    protected $description = 'Reset DayOneMart hub inventory to zero (default) or seed from OpenCart (--from-opencart).';
 
     public function handle(): int
     {
-        $reason = (string) ($this->option('reason') ?: 'Opening balance imported from OpenCart');
-
         $hubIds = ((int) $this->option('hub')) > 0
             ? [(int) $this->option('hub')]
             : Hub::query()->where('is_active', true)->orderBy('id')->pluck('id')->all();
@@ -42,6 +44,66 @@ class LetsyncReseedInventoryCommand extends Command
             return self::FAILURE;
         }
 
+        return $this->option('from-opencart')
+            ? $this->seedFromOpenCart($hubIds)
+            : $this->resetToZero($hubIds);
+    }
+
+    private function resetToZero(array $hubIds): int
+    {
+        $items = Item::query()->whereNotNull('external_id')->get(['id']);
+        $total = $items->count();
+        $this->info("Resetting {$total} items to ZERO stock across hubs [" . implode(', ', $hubIds) . ']...');
+
+        $bar = $this->output->createProgressBar($total);
+        $bar->start();
+
+        $done = 0;
+        $failures = 0;
+
+        foreach ($items as $item) {
+            try {
+                DB::transaction(function () use ($item, $hubIds): void {
+                    ItemStock::updateOrCreate(
+                        ['item_id' => $item->id],
+                        ['quantity' => 0, 'stock_type' => 'out_of_stock', 'is_limited_stock' => true]
+                    );
+
+                    foreach ($hubIds as $hubId) {
+                        // Drop the OpenCart-derived opening balances we created earlier.
+                        InventoryMovement::where('item_id', $item->id)
+                            ->where('hub_id', $hubId)
+                            ->where('variant_key', '')
+                            ->where('reference_type', 'letsync')
+                            ->delete();
+
+                        InventoryStock::updateOrCreate(
+                            ['item_id' => $item->id, 'hub_id' => $hubId, 'variant_key' => ''],
+                            ['quantity' => 0, 'reserved_quantity' => 0, 'is_limited_stock' => true]
+                        );
+                    }
+                });
+                $done++;
+            } catch (Throwable $exception) {
+                $failures++;
+                $this->newLine();
+                $this->warn("item #{$item->id} failed: " . $exception->getMessage());
+            }
+
+            $bar->advance();
+        }
+
+        $bar->finish();
+        $this->newLine();
+        $this->info("Done (zero mode). reset={$done}, failed={$failures}.");
+
+        return self::SUCCESS;
+    }
+
+    private function seedFromOpenCart(array $hubIds): int
+    {
+        $reason = (string) ($this->option('reason') ?: 'Opening balance imported from OpenCart');
+
         $this->info('Reading OpenCart quantities...');
         $ocProducts = DB::connection('opencart')->table('product')
             ->get(['product_id', 'quantity', 'subtract'])
@@ -50,7 +112,7 @@ class LetsyncReseedInventoryCommand extends Command
 
         $items = Item::query()->whereNotNull('external_id')->get(['id', 'external_id']);
         $total = $items->count();
-        $this->info("Re-seeding {$total} items across hubs [" . implode(', ', $hubIds) . ']...');
+        $this->info("Seeding {$total} items from OpenCart across hubs [" . implode(', ', $hubIds) . ']...');
 
         $bar = $this->output->createProgressBar($total);
         $bar->start();
@@ -72,7 +134,6 @@ class LetsyncReseedInventoryCommand extends Command
 
             try {
                 DB::transaction(function () use ($item, $hubIds, $quantity, $isLimited, $reason): void {
-                    // Keep the master mirror aligned with the opening balance.
                     ItemStock::updateOrCreate(
                         ['item_id' => $item->id],
                         [
@@ -83,7 +144,6 @@ class LetsyncReseedInventoryCommand extends Command
                     );
 
                     foreach ($hubIds as $hubId) {
-                        // Fresh opening balance: clear prior movements for this hub stock.
                         InventoryMovement::where('item_id', $item->id)
                             ->where('hub_id', $hubId)
                             ->where('variant_key', '')
@@ -91,11 +151,7 @@ class LetsyncReseedInventoryCommand extends Command
 
                         InventoryStock::updateOrCreate(
                             ['item_id' => $item->id, 'hub_id' => $hubId, 'variant_key' => ''],
-                            [
-                                'quantity' => $quantity,
-                                'reserved_quantity' => 0,
-                                'is_limited_stock' => $isLimited,
-                            ]
+                            ['quantity' => $quantity, 'reserved_quantity' => 0, 'is_limited_stock' => $isLimited]
                         );
 
                         InventoryMovement::create([
@@ -124,7 +180,7 @@ class LetsyncReseedInventoryCommand extends Command
 
         $bar->finish();
         $this->newLine();
-        $this->info("Done. seeded={$seeded}, no-oc-match={$missing}, failed={$failures}.");
+        $this->info("Done (opencart mode). seeded={$seeded}, no-oc-match={$missing}, failed={$failures}.");
 
         return self::SUCCESS;
     }
