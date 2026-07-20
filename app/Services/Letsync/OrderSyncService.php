@@ -12,6 +12,8 @@ use Illuminate\Support\Facades\DB;
 
 class OrderSyncService
 {
+    private int|null|false $defaultHub = false;
+
     public function __construct(
         private readonly OpenCartReader $reader,
         private readonly CustomerSyncService $customers,
@@ -60,6 +62,7 @@ class OrderSyncService
 
         $order = Order::where('external_id', $externalId)->first() ?? new Order();
         $order->external_id = $externalId;
+        $order->hub_id = $this->defaultHubId();
         $order->fill([
             'readable_id' => $order->readable_id ?: 'OC-' . $externalId,
             'module_id' => (int) config('letsync.module_id'),
@@ -90,39 +93,43 @@ class OrderSyncService
 
         $this->syncItems($order, $data['products']);
         $this->syncPayment($order, $ocOrder, $totals['total']);
-        $this->syncAddresses($order, $ocOrder);
+        $this->syncAddress($order, $ocOrder);
 
         return $order;
     }
 
-    private function syncAddresses(Order $order, array $ocOrder): void
+    /**
+     * DayOneMart keeps a SINGLE delivery address per order (type = shipping),
+     * with the address stored as JSON {"address_line": "..."} (OrderAddress
+     * casts `address` => array). The admin "Delivery Info" panel reads the
+     * orderAddress hasOne relation, so anything other than one shipping row
+     * either renders blank (plain-string address won't json_decode) or picks
+     * the wrong record. We prefer OpenCart shipping fields and fall back to the
+     * payment (billing) fields when no shipping address was captured.
+     */
+    private function syncAddress(Order $order, array $ocOrder): void
     {
         $email = trim((string) ($ocOrder['email'] ?? '')) ?: null;
         $phone = trim((string) ($ocOrder['telephone'] ?? '')) ?: null;
 
-        $this->upsertAddress($order, 'billing', $ocOrder, 'payment_', $email, $phone);
+        $prefix = (trim((string) ($ocOrder['shipping_address_1'] ?? '')) !== ''
+            || trim((string) ($ocOrder['shipping_city'] ?? '')) !== '')
+            ? 'shipping_' : 'payment_';
 
-        $hasShipping = trim((string) ($ocOrder['shipping_address_1'] ?? '')) !== ''
-            || trim((string) ($ocOrder['shipping_city'] ?? '')) !== '';
-
-        if ($hasShipping) {
-            $this->upsertAddress($order, 'shipping', $ocOrder, 'shipping_', $email, $phone);
-        }
-    }
-
-    private function upsertAddress(Order $order, string $type, array $ocOrder, string $prefix, ?string $email, ?string $phone): void
-    {
         $name = trim(($ocOrder[$prefix . 'firstname'] ?? '') . ' ' . ($ocOrder[$prefix . 'lastname'] ?? ''));
         if ($name === '') {
             $name = trim(($ocOrder['firstname'] ?? '') . ' ' . ($ocOrder['lastname'] ?? ''));
         }
 
-        $addressLine = trim(($ocOrder[$prefix . 'address_1'] ?? '') . ' ' . ($ocOrder[$prefix . 'address_2'] ?? ''));
+        $line = $this->composeAddressLine($ocOrder, $prefix);
 
-        $address = OrderAddress::where('order_id', $order->id)->where('type', $type)->first() ?? new OrderAddress();
+        // Collapse to a single shipping row (drop legacy billing duplicates).
+        OrderAddress::where('order_id', $order->id)->where('type', '!=', 'shipping')->delete();
+
+        $address = OrderAddress::where('order_id', $order->id)->where('type', 'shipping')->first() ?? new OrderAddress();
         $address->fill([
             'order_id' => $order->id,
-            'type' => $type,
+            'type' => 'shipping',
             'name' => $name ?: null,
             'phone' => $phone,
             'email' => $email,
@@ -130,9 +137,35 @@ class OrderSyncService
             'city' => trim((string) ($ocOrder[$prefix . 'city'] ?? '')) ?: null,
             'state' => trim((string) ($ocOrder[$prefix . 'zone'] ?? '')) ?: null,
             'country' => trim((string) ($ocOrder[$prefix . 'country'] ?? '')) ?: null,
-            'address' => $addressLine ?: null,
+            'address' => $line !== '' ? ['address_line' => $line] : null,
         ]);
         $address->save();
+    }
+
+    private function composeAddressLine(array $ocOrder, string $prefix): string
+    {
+        $parts = [
+            trim((string) ($ocOrder[$prefix . 'address_1'] ?? '')),
+            trim((string) ($ocOrder[$prefix . 'address_2'] ?? '')),
+            trim((string) ($ocOrder[$prefix . 'city'] ?? '')),
+            trim((string) ($ocOrder[$prefix . 'zone'] ?? '')),
+            trim((string) ($ocOrder[$prefix . 'country'] ?? '')),
+            trim((string) ($ocOrder[$prefix . 'postcode'] ?? '')),
+        ];
+
+        return implode(', ', array_filter($parts, static fn (string $p): bool => $p !== ''));
+    }
+
+    private function defaultHubId(): ?int
+    {
+        if ($this->defaultHub === false) {
+            $configured = config('letsync.default_hub_id');
+            $this->defaultHub = $configured !== null
+                ? (int) $configured
+                : DB::table('hubs')->where('is_active', 1)->orderBy('id')->value('id');
+        }
+
+        return $this->defaultHub;
     }
 
     private function resolveCustomer(array $ocOrder): array
